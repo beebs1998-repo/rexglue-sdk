@@ -789,7 +789,14 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // D3D9 HACK: Vertices to use are always in vf0, and are written by the CPU.
   xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
   if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 3 * 2) {
-    REXGPU_ERROR("Unsupported resolve vertex buffer format");
+    // Rate-limited: DFKBL spams this thousands of times per second in dense
+    // scenes, and synchronous logging saturates the command processor thread
+    // (guest-visible slowdown). Log the first occurrences only.
+    static uint32_t unsupported_vb_log_count = 0;
+    if (unsupported_vb_log_count++ < 16) {
+      REXGPU_ERROR("Unsupported resolve vertex buffer format (occurrence {})",
+                   unsupported_vb_log_count);
+    }
     assert_always();
     return false;
   }
@@ -997,8 +1004,15 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                                                      rb_copy_dest_pitch.copy_dest_pitch, bpp_log2);
     }
   } else {
-    REXGPU_ERROR("Tried to resolve to format {}, which is not a ColorFormat",
-                 dest_format_info.name);
+    // Rate-limited: k_1_REVERSE resolve destinations spam at extremely high
+    // frequency in DFKBL (hundreds of thousands per session); synchronous
+    // logging saturates the command processor thread.
+    static uint32_t non_color_dest_log_count = 0;
+    if (non_color_dest_log_count++ < 16) {
+      REXGPU_ERROR("Tried to resolve to format {}, which is not a ColorFormat "
+                   "(occurrence {})",
+                   dest_format_info.name, non_color_dest_log_count);
+    }
     copy_dest_extent_start = copy_dest_base_adjusted;
     copy_dest_extent_end = copy_dest_base_adjusted;
   }

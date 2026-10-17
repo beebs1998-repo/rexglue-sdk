@@ -39,6 +39,37 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
 
+// Games that pace simulation off VBlanks implement slowdown as frame-skipping
+// (one update per N VBlanks), which halves the effective framerate. When this
+// is enabled the VBlank worker detects swaps arriving every 2+ VBlanks and
+// temporarily doubles the VBlank rate, restoring ~full motion speed during
+// heavy scenes while leaving normal-pace pacing untouched.
+// NOTE: Testing (dfkbl, 2026-08-25) proved the game's slowdown depth is
+// independent of VBlank rate (multiplier 1 vs 3 produced identical results),
+// i.e. the mechanic is guest-time-based, not vblank-count-based. Boost
+// therefore defaults OFF; kept available since some titles DO pace off
+// vblanks and it only ever engages on detected skip patterns.
+REXCVAR_DEFINE_BOOL(slowdown_pacing_boost, false, "GPU",
+                    "Detect game-side frame skipping (slowdown) and temporarily raise the "
+                    "VBlank rate to compensate pacing. Only helps titles whose slowdown is "
+                    "vblank-count-based; has no effect on time-based slowdown mechanics.");
+
+// Per-second telemetry correlating guest swap cadence against VBlank cadence.
+// Use it during a heavy section: if swaps/s collapses while vblanks/s stays
+// constant, the game's plateau pacing is self-timed (kernel waits), and the
+// measured swaps/s IS the assist's target rate.
+REXCVAR_DEFINE_BOOL(slowdown_debug_log, false, "GPU",
+                    "Log per-second VBlank/swap cadence and boost state to diagnose "
+                    "game slowdown mechanics.");
+
+REXCVAR_DEFINE_DOUBLE(slowdown_pacing_boost_multiplier, 1.5, "GPU",
+                      "VBlank rate multiplier applied while slowdown boost is engaged. "
+                      "Effective slowdown sim rate ~= 30 Hz * multiplier at a 60 Hz video "
+                      "mode (1.5 ~= 45 fps, 2.0 = parity with normal pace). Values above "
+                      "2.0 make heavy scenes run FASTER than normal pace. Read every "
+                      "frame, so it can also be tuned live via the settings overlay (F4).")
+    .range(1.0, 3.0);
+
 namespace {
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
@@ -158,14 +189,103 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+
+        // Adaptive slowdown compensation state. The game skips simulation
+        // updates during heavy scenes (a swap every >=2 VBlanks); raising the
+        // VBlank rate while that persists restores motion speed. Detection
+        // uses a windowed time-weighted average of the vblank-to-swap gap:
+        // per-vblank swaps average ~0.5, half-rate skipping ~1.5, so the
+        // thresholds below cleanly separate normal play from slowdown.
+        bool boost_engaged = false;
+        uint32_t boost_slow_windows = 0;
+        uint32_t boost_fast_windows = 0;
+        double gap_window_sum = 0.0;
+        uint32_t gap_window_samples = 0;
+        uint32_t gap_window_ticks = 0;
+        constexpr uint32_t kGapWindowTicks = 96;  // ~96 ms per decision window
+        const double recent_swap_window_seconds = 2.0;
+        const uint64_t recent_swap_max_gap =
+            std::max<uint64_t>(1, uint64_t(refresh_rate_hz * recent_swap_window_seconds));
+
+        // Debug telemetry state (slowdown_debug_log).
+        const bool debug_log = REXCVAR_GET(slowdown_debug_log);
+        uint32_t debug_tick = 0;
+        constexpr uint32_t kDebugLogTicks = 1000;  // ~1 s at the 1 ms worker cadence
+        uint64_t dbg_last_vb = 0;
+        uint64_t dbg_last_swaps = 0;
+        double dbg_gap_sum = 0.0;
+        uint32_t dbg_gap_n = 0;
+
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+
+          if (REXCVAR_GET(vsync) && REXCVAR_GET(slowdown_pacing_boost)) {
+            const uint64_t vb = vblank_count_.load(std::memory_order_relaxed);
+            const uint64_t last_swap = last_swap_vblank_.load(std::memory_order_relaxed);
+            const uint64_t gap = vb - last_swap;
+            const bool actively_rendering = gap <= recent_swap_max_gap;
+
+            ++gap_window_ticks;
+            gap_window_sum += static_cast<double>(gap);
+            ++gap_window_samples;
+            if (gap_window_ticks >= kGapWindowTicks) {
+              const double avg_gap =
+                  gap_window_samples ? gap_window_sum / gap_window_samples : 0.0;
+              gap_window_sum = 0.0;
+              gap_window_samples = 0;
+              gap_window_ticks = 0;
+              if (actively_rendering && avg_gap >= 1.3) {
+                boost_fast_windows = 0;
+                if (++boost_slow_windows >= 2) {
+                  boost_engaged = true;
+                }
+              } else if (!actively_rendering || avg_gap <= 0.9) {
+                boost_slow_windows = 0;
+                if (++boost_fast_windows >= 2) {
+                  boost_engaged = false;
+                }
+              }
+            }
+
+            if (boost_engaged) {
+              const double mult = REXCVAR_GET(slowdown_pacing_boost_multiplier);
+              if (mult > 1.001) {
+                interval_ticks = std::max(
+                    uint64_t(1), uint64_t(double(interval_ticks) / mult));
+              }
+            }
+          }
+
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
           }
+
+          if (debug_log) {
+            ++debug_tick;
+            const uint64_t vb_now = vblank_count_.load(std::memory_order_relaxed);
+            const uint64_t last_swap_now =
+                last_swap_vblank_.load(std::memory_order_relaxed);
+            dbg_gap_sum += static_cast<double>(vb_now - last_swap_now);
+            ++dbg_gap_n;
+            if (debug_tick >= kDebugLogTicks) {
+              const uint64_t sw_now = swap_count_.load(std::memory_order_relaxed);
+              const double avg_gap =
+                  dbg_gap_n ? dbg_gap_sum / dbg_gap_n : 0.0;
+              REXGPU_INFO(
+                  "[slowdown-debug] vb/s={} swaps/s={} avg_gap={:.2f} boost={}",
+                  vb_now - dbg_last_vb, sw_now - dbg_last_swaps, avg_gap,
+                  boost_engaged ? "on" : "off");
+              dbg_last_vb = vb_now;
+              dbg_last_swaps = sw_now;
+              dbg_gap_sum = 0.0;
+              dbg_gap_n = 0;
+              debug_tick = 0;
+            }
+          }
+
           rex::thread::Sleep(std::chrono::milliseconds(1));
         }
         return 0;
@@ -316,11 +436,18 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                          rex::countof(args));
 }
 
+void GraphicsSystem::NotifySwapSubmitted() {
+  swap_count_.fetch_add(1, std::memory_order_relaxed);
+  last_swap_vblank_.store(vblank_count_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+}
+
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
 
   // Increment vblank counter (so the game sees us making progress).
+  vblank_count_.fetch_add(1, std::memory_order_relaxed);
   if (command_processor_) {
     command_processor_->increment_counter();
   }

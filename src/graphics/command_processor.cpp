@@ -203,7 +203,36 @@ void CommandProcessor::WorkerThreadMain() {
     return;
   }
 
+  // Per-second CP telemetry (slowdown_debug_log): separates time spent
+  // executing guest commands from time stalled awaiting work, and counts
+  // processed primary-buffer indices. A saturated CP (exec_ms ~1000 with a
+  // large backlog) throttles the game's read-pointer polling loop.
+  const bool cp_debug = REXCVAR_GET(slowdown_debug_log);
+  std::chrono::steady_clock::time_point dbg_window_start =
+      std::chrono::steady_clock::now();
+  double dbg_exec_ms = 0.0;
+  double dbg_stall_ms = 0.0;
+  uint64_t dbg_exec_calls = 0;
+  uint64_t dbg_words = 0;
+  uint32_t dbg_last_read = read_ptr_index_;
+
   while (worker_running_) {
+    if (cp_debug) {
+      const auto now = std::chrono::steady_clock::now();
+      const double window_ms =
+          std::chrono::duration<double, std::milli>(now - dbg_window_start).count();
+      if (window_ms >= 1000.0) {
+        REXGPU_INFO(
+            "[cp-debug] exec_ms={:.0f} stall_ms={:.0f} buffers={} kwords/s={:.0f}",
+            dbg_exec_ms, dbg_stall_ms, dbg_exec_calls,
+            double(dbg_words) / (window_ms * 1.0));
+        dbg_window_start = now;
+        dbg_exec_ms = 0.0;
+        dbg_stall_ms = 0.0;
+        dbg_exec_calls = 0;
+        dbg_words = 0;
+      }
+    }
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
@@ -217,6 +246,7 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      const auto stall_start = std::chrono::steady_clock::now();
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
@@ -232,6 +262,12 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+      if (cp_debug) {
+        dbg_stall_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                      stall_start)
+                .count();
+      }
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -239,7 +275,16 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
+    const auto exec_start = std::chrono::steady_clock::now();
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    if (cp_debug) {
+      const auto exec_end = std::chrono::steady_clock::now();
+      dbg_exec_ms +=
+          std::chrono::duration<double, std::milli>(exec_end - exec_start).count();
+      ++dbg_exec_calls;
+      dbg_words += uint64_t((read_ptr_index_ - dbg_last_read) & 0xFFFFFF);
+      dbg_last_read = read_ptr_index_;
+    }
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -960,6 +1005,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
+  // Tell the VBlank worker a frame was presented (for slowdown pacing boost).
+  if (graphics_system_) {
+    graphics_system_->NotifySwapSubmitted();
+  }
+
   ++counter_;
   return true;
 }
@@ -1381,17 +1431,24 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       if (!draw_succeeded) {
-        auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
-        auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
-        auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
-        REXGPU_ERROR(
-            "{}({}, {}, {}): Failed in backend "
-            "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",
-            opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
-            uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
-            uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
-            uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
-            uint32_t(rb_modecontrol.edram_mode));
+        // Rate-limited: failing resolve-draws recur thousands of times per
+        // second in DFKBL dense scenes; synchronous logging saturates this
+        // thread and throttles the guest.
+        static uint32_t draw_failed_log_count = 0;
+        if (draw_failed_log_count++ < 8) {
+          auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
+          auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
+          auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
+          REXGPU_ERROR(
+              "{}({}, {}, {}): Failed in backend "
+              "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={}) "
+              "[occurrence {}]",
+              opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
+              uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
+              uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
+              uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
+              uint32_t(rb_modecontrol.edram_mode), draw_failed_log_count);
+        }
       }
     }
   }

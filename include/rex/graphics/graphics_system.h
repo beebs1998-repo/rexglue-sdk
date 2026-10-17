@@ -77,6 +77,16 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
+  // Called by the command processor whenever the guest submits a frame (swap).
+  // Used by the adaptive VBlank worker to detect game-side frame skipping
+  // (slowdown) and temporarily boost the VBlank rate.
+  void NotifySwapSubmitted();
+
+  // Monotonically increasing count of VBlanks generated since SetupPresentation.
+  uint64_t vblank_count() const { return vblank_count_.load(std::memory_order_relaxed); }
+  // Total swaps submitted by the guest since SetupPresentation (debug telemetry).
+  uint64_t swap_count() const { return swap_count_.load(std::memory_order_relaxed); }
+
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
 
@@ -119,6 +129,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
   uint32_t interrupt_callback_data_ = 0;
 
   std::atomic<bool> vsync_worker_running_;
+  std::atomic<uint64_t> vblank_count_{0};
+  std::atomic<uint64_t> last_swap_vblank_{0};
+  std::atomic<uint64_t> swap_count_{0};
   system::object_ref<system::XHostThread> vsync_worker_thread_;
 
   RegisterFile register_file_;
