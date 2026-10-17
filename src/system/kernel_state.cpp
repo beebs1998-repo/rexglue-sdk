@@ -752,7 +752,9 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
       auto global_lock = global_critical_region_.Acquire();
       auto [lib_it, inserted] = module_libraries_.emplace(lib_key, rex::platform::DynamicLibrary{});
       if (!inserted) {
-        REXSYS_ERROR("Recompiled module '{}' already loaded; refusing duplicate load", lib_key);
+        REXSYS_ERROR("Recompiled module '{}' already loaded; refusing duplicate load "
+                     "(module_libraries_.size={})",
+                     lib_key, module_libraries_.size());
         object_table()->ReleaseHandle(module->handle());
         return nullptr;
       }
@@ -854,6 +856,8 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module, bool ca
     auto global_lock = global_critical_region_.Acquire();
 
     auto recomp = FindRecompiledModule(module->path());
+    REXSYS_INFO("UnloadUserModule('{}'): recomp={} module_libraries={}", module->path(),
+                recomp ? "found" : "NOT FOUND", module_libraries_.size());
     if (recomp) {
       const std::string& key = recomp->guest_path;
       auto cleared_range = function_dispatcher_->UnregisterModule(key);
@@ -915,8 +919,15 @@ std::optional<KernelState::RecompiledModuleInfo> KernelState::FindRecompiledModu
     std::string_view guest_path) {
   auto global_lock = global_critical_region_.Acquire();
   auto normalized = NormalizeGuestPath(guest_path);
+  // The kernel canonicalizes loaded module paths to NT device form
+  // (\Device\Harddisk0\Partition1\name), which has no drive colon for
+  // NormalizeGuestPath's device-prefix strip. Manifest entries are pure
+  // filenames, so also match on the extracted filename.
+  auto filename = rex::string::utf8_find_name_from_guest_path(guest_path);
+  std::transform(filename.begin(), filename.end(), filename.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   for (const auto& info : recompiled_modules_) {
-    if (info.guest_path == normalized)
+    if (info.guest_path == normalized || info.guest_path == filename)
       return info;
   }
   return std::nullopt;
