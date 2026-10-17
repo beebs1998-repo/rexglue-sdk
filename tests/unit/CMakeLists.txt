@@ -36,6 +36,10 @@ target_link_libraries(unit_tests PRIVATE
     rexcodegen
     rexruntime
     Catch2::Catch2WithMain
+    # rex/hash.h is a public header of rexcore that includes <xxhash.h>, but
+    # rexcore links xxHash PRIVATE so the include path never reaches consumers.
+    # Link it here so the test target can compile against the public headers.
+    xxHash::xxhash
 )
 
 # ReXApp is shipped as source for recomp projects, rather than compiled into

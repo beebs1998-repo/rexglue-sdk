@@ -38,6 +38,28 @@ std::string NormalizeGuestPath(std::string_view path) {
   std::transform(result.begin(), result.end(), result.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
+  // NT device paths (\Device\Harddisk0\Partition1\...) carry no drive colon, so
+  // the strip above misses them. Drop the mount prefix through the first
+  // "partitionN" segment so the result matches manifest-style guest paths.
+  // Without this, the kernel's NT path for a loaded module never compares equal
+  // to the manifest guest path, and unload cannot find the recompiled module.
+  if (result.rfind("device/", 0) == 0) {
+    constexpr std::string_view kPartitionPrefix = "partition";
+    for (std::size_t pos = 0; pos < result.size();) {
+      std::size_t next = result.find('/', pos);
+      std::size_t end = (next == std::string::npos) ? result.size() : next;
+      std::string_view segment(result.data() + pos, end - pos);
+      if (segment.rfind(kPartitionPrefix, 0) == 0) {
+        result.erase(0, (next == std::string::npos) ? result.size() : next + 1);
+        break;
+      }
+      if (next == std::string::npos) {
+        break;
+      }
+      pos = next + 1;
+    }
+  }
+
   return result;
 }
 
