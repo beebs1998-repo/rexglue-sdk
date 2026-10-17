@@ -100,6 +100,12 @@ u32 XexLoadImage_entry(mapped_string module_name, u32 module_flags, u32 min_vers
       auto ldr_data = REX_KERNEL_MEMORY()->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(hmodule);
       ldr_data->load_count++;
       result = X_STATUS_SUCCESS;
+      REXSYS_INFO("XexLoadImage('{}'): existing module {:08X}, load_count now {}",
+                  module_name.value(), hmodule,
+                  static_cast<uint32_t>(ldr_data->load_count));
+    } else {
+      REXSYS_INFO("XexLoadImage('{}'): no existing module, loading fresh",
+                  module_name.value());
     }
   }
 
@@ -113,6 +119,8 @@ u32 XexLoadImage_entry(mapped_string module_name, u32 module_flags, u32 min_vers
       auto ldr_data = REX_KERNEL_MEMORY()->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(hmodule);
       ldr_data->load_count++;
       result = X_STATUS_SUCCESS;
+    } else {
+      REXSYS_ERROR("XexLoadImage('{}'): LoadUserModule failed", module_name.value());
     }
   }
 
@@ -124,11 +132,14 @@ u32 XexLoadImage_entry(mapped_string module_name, u32 module_flags, u32 min_vers
 u32 XexUnloadImage_entry(mapped_void hmodule) {
   auto module = XModule::GetFromHModule(REX_KERNEL_STATE(), hmodule);
   if (!module) {
+    REXSYS_WARN("XexUnloadImage({:08X}): not a valid module handle", uint32_t(hmodule));
     return X_STATUS_INVALID_HANDLE;
   }
   if (module->module_type() == XModule::ModuleType::kKernelModule) {
     return X_STATUS_SUCCESS;
   }
+
+  REXSYS_INFO("XexUnloadImage('{}', {:08X})", module->path(), uint32_t(hmodule));
 
   // Decrement-and-check under the global lock so concurrent unloads can't both
   // observe zero and double-free.
@@ -137,6 +148,8 @@ u32 XexUnloadImage_entry(mapped_void hmodule) {
     auto lock = rex::thread::global_critical_region::AcquireDirect();
     auto ldr_data = hmodule.as<X_LDR_DATA_TABLE_ENTRY*>();
     last_ref = (--ldr_data->load_count == 0);
+    REXSYS_INFO("XexUnloadImage('{}'): load_count now {}, last_ref={}", module->path(),
+                static_cast<uint32_t>(ldr_data->load_count), last_ref ? 1 : 0);
   }
 
   if (last_ref) {
