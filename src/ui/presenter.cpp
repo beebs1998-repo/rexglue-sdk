@@ -29,6 +29,13 @@
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 
+REXCVAR_DEFINE_BOOL(present_guest_thread_immediate, false, "UI/Presenter",
+                    "Force guest-output presentation from the guest output thread even when "
+                    "UI drawers (ImGui overlays, notifications) are registered. Lower "
+                    "latency and smoother pacing, but overlay contents freeze while "
+                    "gameplay renders; they refresh again whenever the UI repaints "
+                    "(menu transitions, window events).");
+
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 
@@ -1317,6 +1324,11 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
     // Don't be causing host vertical sync CPU waits in the thread generating
     // the guest output.
     return PaintMode::kUIThreadOnRequest;
+  }
+  if (REXCVAR_GET(present_guest_thread_immediate)) {
+    // Perf override: keep the low-latency immediate path even with UI drawers
+    // registered. UI contents stop refreshing during gameplay by design.
+    return PaintMode::kGuestOutputThreadImmediately;
   }
   if (!ui_drawers_.empty()) {
     // The UI can be drawn only by the UI thread, and it needs to be drawn -

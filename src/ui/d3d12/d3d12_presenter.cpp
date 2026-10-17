@@ -32,6 +32,8 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
+REXCVAR_DEFINE_BOOL(d3d12_present_vsync, false, "UI/D3D12",
+                    "Enable VSync for guest output presentation (wait for vertical blank)");
 
 namespace rex::ui::d3d12 {
 
@@ -1147,17 +1149,15 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ui_submission_tracker_.NextSubmission();
   }
   paint_context_.paint_submission_tracker.NextSubmission();
-  // Present as soon as possible, without waiting for vsync (the host refresh
-  // rate may be something like 144 Hz, which is not a multiple of the common
-  // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
-  // frames for lower latency. Also, if possible, allowing tearing to use
-  // variable refresh rate in borderless fullscreen (note that if DXGI
-  // fullscreen is ever used in, the allow tearing flag must not be passed in
-  // fullscreen, but DXGI fullscreen is largely unneeded with the flip
-  // presentation model used in Direct3D 12).
+  // Present with VSync if enabled, otherwise present immediately without waiting.
+  // Note: The host refresh rate may not be a multiple of the common 30 Hz or 60 Hz
+  // guest refresh rate. With VSync on, frames will wait for the next vertical blank.
+  // With VSync off, frames are presented immediately for lower latency.
+  // Allowing tearing to use variable refresh rate in borderless fullscreen.
+  const UINT sync_interval = REXCVAR_GET(d3d12_present_vsync) ? 1 : 0;
   HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+      sync_interval, DXGI_PRESENT_RESTART |
+                         (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
