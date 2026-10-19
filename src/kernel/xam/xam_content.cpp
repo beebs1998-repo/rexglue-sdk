@@ -107,8 +107,6 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
     // TODO(gibbed): disc drive content
   }
 
-  REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
-
   *handle_out = e->handle();
   return X_ERROR_SUCCESS;
 }

@@ -9,16 +9,19 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <queue>
 #include <string>
+#include <vector>
 
 #include <fmt/format.h>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -226,32 +229,58 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
                                                uint32_t title_id, XContentType content_type,
                                                XCONTENT_AGGREGATE_DATA& data) const {
   auto header_file_path = ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
-  constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
 
   if (!std::filesystem::exists(header_file_path)) {
-    return X_ERROR_FILE_NOT_FOUND;
+    return X_STATUS_NO_SUCH_FILE;
   }
 
   auto file = rex::filesystem::OpenFile(header_file_path, "rb");
   if (!file) {
-    return X_ERROR_FILE_NOT_FOUND;
+    return X_STATUS_NO_SUCH_FILE;
   }
 
   auto file_size = std::filesystem::file_size(header_file_path);
-  if (file_size < header_size) {
+  if (file_size < sizeof(XCONTENT_AGGREGATE_DATA)) {
     fclose(file);
-    return X_ERROR_FILE_NOT_FOUND;
+    return X_STATUS_NO_SUCH_FILE;
   }
 
-  std::array<uint8_t, header_size> buffer;
-  size_t result = fread(buffer.data(), 1, header_size, file);
+  // Read enough of the header to cover either a raw XCONTENT_AGGREGATE_DATA
+  // dump or a full STFS/XContent package header ("CON "/"LIVE "/"PIRS").
+  std::vector<uint8_t> buffer(std::min<size_t>(file_size, sizeof(rex::filesystem::StfsHeader)));
+  size_t read = fread(buffer.data(), 1, buffer.size(), file);
   fclose(file);
-
-  if (result != header_size) {
-    return X_ERROR_FILE_NOT_FOUND;
+  if (read != buffer.size()) {
+    return X_STATUS_NO_SUCH_FILE;
   }
 
-  std::memcpy(&data, buffer.data(), buffer.size());
+  const auto package = reinterpret_cast<const rex::filesystem::StfsHeader*>(buffer.data());
+  if (buffer.size() == sizeof(rex::filesystem::StfsHeader) && package->header.is_magic_valid()) {
+    // STFS/XContent package header as written by real hardware or Xenia.
+    // The metadata carries content_type + display names; the file_name must
+    // stay the directory name, so only those fields are extracted.
+    const auto& metadata = package->metadata;
+    data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+    data.content_type = metadata.content_type;
+    uint32_t lang_count = uint32_t(metadata.metadata_version) >= 2
+                              ? rex::filesystem::XContentMetadata::kNumLanguagesV2
+                              : rex::filesystem::XContentMetadata::kNumLanguagesV1;
+    for (uint32_t lang = 1; lang <= lang_count; ++lang) {
+      auto value = metadata.display_name(static_cast<XLanguage>(lang));
+      if (!value.empty()) {
+        data.set_display_name(value);
+        break;
+      }
+    }
+    data.set_file_name(file_name);
+    data.padding[0] = data.padding[1] = 0;
+    data.xuid = xuid;
+    data.title_id = title_id;
+    return X_ERROR_SUCCESS;
+  }
+
+  // Raw XCONTENT_AGGREGATE_DATA dump as written by WriteContentHeaderFile.
+  std::memcpy(&data, buffer.data(), sizeof(XCONTENT_AGGREGATE_DATA));
   return X_ERROR_SUCCESS;
 }
 
