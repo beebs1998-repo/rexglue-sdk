@@ -43,8 +43,16 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
-                    "Submit command list when PM4 primary buffer ends")
+// Default false: submitting per primary-buffer chunk (default true upstream)
+// costs ~2x fence signal + ExecuteCommandLists + allocator reset per ~0.13ms
+// chunk (~140-190x/frame in dense scenes) and hard-quantizes DFKBL frame times
+// to 33ms. Batching to swap/sync boundaries fixed the DFKBL dip-slowdown class
+// (verified 2026-10-19 on isolated v0.10.0 build; see TRACKING.md iter 27 and
+// XENIA_CANARY_SLOWDOWN_FINDINGS.md). Guest-visible sync points still flush.
+REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, false, "GPU/D3D12",
+                    "Submit command list when PM4 primary buffer ends. Keep off: "
+                    "per-chunk submission starves dense scenes (33ms frame quantization "
+                    "in DFKBL); submissions still flush at swap and explicit sync points.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
