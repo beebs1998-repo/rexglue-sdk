@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 #include <rex/assert.h>
@@ -789,7 +790,24 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // D3D9 HACK: Vertices to use are always in vf0, and are written by the CPU.
   xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
   if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 3 * 2) {
-    REXGPU_ERROR("Unsupported resolve vertex buffer format");
+    // Rate-limited to the first 16 occurrences per run: DFKBL issues these
+    // known, gracefully-dropped resolves in bursts (~10k lines/s in heavy
+    // scenes), and each REXGPU_ERROR flushes synchronously to the log file
+    // (per-message FlushFileBuffers). Log the first few with vf0 details,
+    // a suppression notice once, then stay silent for the rest of the run.
+    static std::atomic<uint32_t> unsupported_vb_format_log_index(0);
+    uint32_t unsupported_vb_format_log = unsupported_vb_format_log_index.fetch_add(1);
+    if (unsupported_vb_format_log < 16) {
+      REXGPU_ERROR(
+          "Unsupported resolve vertex buffer format "
+          "(vf0: type={}, size={}, address={:#x}, endian={})",
+          uint32_t(fetch.type), uint32_t(fetch.size), uint32_t(fetch.address),
+          uint32_t(fetch.endian));
+    } else if (unsupported_vb_format_log == 16) {
+      REXGPU_ERROR(
+          "Unsupported resolve vertex buffer format "
+          "(rate-limited: additional occurrences suppressed for this run)");
+    }
     assert_always();
     return false;
   }
@@ -997,8 +1015,24 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                                                      rb_copy_dest_pitch.copy_dest_pitch, bpp_log2);
     }
   } else {
-    REXGPU_ERROR("Tried to resolve to format {}, which is not a ColorFormat",
-                 dest_format_info.name);
+    // Rate-limited to the first 16 occurrences per run, with copy destination
+    // details: DFKBL hits these known, gracefully-dropped resolves at a very
+    // high rate (see the unsupported-resolve-vb-format note above).
+    static std::atomic<uint32_t> unresolvable_dest_format_log_index(0);
+    uint32_t unresolvable_dest_format_log =
+        unresolvable_dest_format_log_index.fetch_add(1);
+    if (unresolvable_dest_format_log < 16) {
+      REXGPU_ERROR(
+          "Tried to resolve to format {}, which is not a ColorFormat "
+          "(raw copy_dest_format={}, depth={})",
+          dest_format_info.name, uint32_t(rb_copy_dest_info.copy_dest_format),
+          uint32_t(is_depth));
+    } else if (unresolvable_dest_format_log == 16) {
+      REXGPU_ERROR(
+          "Tried to resolve to format {}, which is not a ColorFormat "
+          "(rate-limited: additional occurrences suppressed for this run)",
+          dest_format_info.name);
+    }
     copy_dest_extent_start = copy_dest_base_adjusted;
     copy_dest_extent_end = copy_dest_base_adjusted;
   }
