@@ -13,7 +13,29 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstring>
+#include <toml++/toml.hpp>
+
 #include <rex/cvar.h>
+
+// temp_directory_path() is not guaranteed writable on every host (patched
+// sandboxed temp mounts), which silently breaks every config-file test:
+// ofstream succeeds-to-fail with failbit and LoadConfig sees a missing or
+// empty file. Probe writability and fall back to the current directory.
+namespace {
+
+std::filesystem::path TestTempDir() {
+  auto temp = std::filesystem::temp_directory_path();
+  std::ofstream probe(temp / "rex_cvar_test_write_probe");
+  if (probe.good()) {
+    probe.close();
+    std::filesystem::remove(temp / "rex_cvar_test_write_probe");
+    return temp;
+  }
+  return std::filesystem::current_path();
+}
+
+}  // namespace
 
 // Test cvars
 REXCVAR_DEFINE_BOOL(test_bool_flag, false, "Test", "Test boolean flag");
@@ -164,7 +186,7 @@ TEST_CASE("cvar GetFlagInfo returns metadata", "[cvar]") {
 TEST_CASE("cvar TOML config loading", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
-  auto temp_dir = std::filesystem::temp_directory_path();
+  auto temp_dir = TestTempDir();
   auto config_path = temp_dir / "test_config.toml";
 
   SECTION("Load flat config") {
@@ -174,13 +196,14 @@ TEST_CASE("cvar TOML config loading", "[cvar]") {
     file << "test_string_flag = \"from config\"\n";
     file.close();
 
-    // Set initial values using REXCVAR_SET
-    REXCVAR_SET(test_bool_flag, false);
-    REXCVAR_SET(test_int32_flag, 0);
-    REXCVAR_SET(test_string_flag, "");
-
+    // No REXCVAR_SET calls here: values written from runtime code carry
+    // Source::kRuntime, which outranks the config file, so placeholders set
+    // this way would (correctly, per the source-precedence model) stop the
+    // config values from applying. ResetAllForTesting above already leaves
+    // every flag at its compiled-in default.
     rex::cvar::LoadConfig(config_path);
 
+    CHECK(rex::cvar::GetFlagSource("test_bool_flag") == rex::cvar::Source::kConfig);
     CHECK(REXCVAR_GET(test_bool_flag) == true);
     CHECK(REXCVAR_GET(test_int32_flag) == 999);
     CHECK(REXCVAR_GET(test_string_flag) == "from config");
@@ -197,7 +220,7 @@ TEST_CASE("cvar TOML config loading", "[cvar]") {
 TEST_CASE("cvar config replays values for flags registered after loading", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
-  auto config_path = std::filesystem::temp_directory_path() / "test_deferred_cvar.toml";
+  auto config_path = TestTempDir() / "test_deferred_cvar.toml";
   {
     std::ofstream file(config_path);
     file << "test_deferred_flag = \"F10\"\n";
@@ -249,7 +272,7 @@ void SetTestEnv(const char* name, const char* value) {
 TEST_CASE("cvar source precedence", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
-  auto config_path = std::filesystem::temp_directory_path() / "test_precedence.toml";
+  auto config_path = TestTempDir() / "test_precedence.toml";
   {
     std::ofstream file(config_path);
     file << "test_string_flag = \"from config\"\n";
@@ -333,7 +356,7 @@ TEST_CASE("cvar source precedence", "[cvar]") {
 TEST_CASE("cvar precedence holds for flags registered after startup", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
-  auto config_path = std::filesystem::temp_directory_path() / "test_late_precedence.toml";
+  auto config_path = TestTempDir() / "test_late_precedence.toml";
   {
     std::ofstream file(config_path);
     file << "test_late_flag = \"from config\"\n";
@@ -519,6 +542,78 @@ TEST_CASE("cvar TOML serialization", "[cvar]") {
   CHECK(toml.find("test_bool_flag") == std::string::npos);
 }
 
+TEST_CASE("cvar TOML serialization escapes strings", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  // Windows-style path with backslashes, a quote, and a control character.
+  REXCVAR_SET(test_string_flag, std::string("i:\\dir\\sub") + '\x01' + "\"q\"");
+
+  auto toml = rex::cvar::SerializeToTOML();
+
+  // The serialized form must be valid TOML: backquotes and quotes escaped,
+  // the control character emitted as \uXXXX.
+  CHECK(toml.find("test_string_flag = \"i:\\\\dir\\\\sub\\u0001\\\"q\\\"\"") !=
+        std::string::npos);
+
+  // Round trip through the real loader restores the exact value.
+  auto config_path = TestTempDir() / "test_escape.toml";
+  {
+    std::ofstream file(config_path);
+    file << toml;
+    CHECK(file.good());
+  }
+  CHECK(std::filesystem::exists(config_path));
+
+  rex::cvar::testing::ResetAllForTesting();
+
+  // The file is closed and flushed; loading it must restore the source and
+  // the exact value, including the characters the serializer escaped.
+  rex::cvar::LoadConfig(config_path);
+  CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kConfig);
+  CHECK(REXCVAR_GET(test_string_flag) == std::string("i:\\dir\\sub") + '\x01' + "\"q\"");
+
+  std::filesystem::remove(config_path);
+}
+
+TEST_CASE("cvar TOML serialization skips invocation-sourced flags", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  // Command line sourcing.
+  char argv0[] = "cvar_test";
+  char arg1[] = "--test_string_flag=from cmdline";
+  char* argv[] = {argv0, arg1};
+  rex::cvar::Init(2, argv);
+
+  // Environment sourcing.
+  SetTestEnv("REX_TEST_INT32_FLAG", "222");
+  rex::cvar::ApplyEnvironment();
+
+  // Config-file sourcing.
+  auto config_path = TestTempDir() / "test_skip.toml";
+  {
+    std::ofstream file(config_path);
+    file << "test_double_flag = 9.0\n";
+  }
+  rex::cvar::LoadConfig(config_path);
+
+  // Runtime/UI sourcing.
+  REXCVAR_SET(test_bool_flag, true);
+
+  auto toml = rex::cvar::SerializeToTOML();
+
+  // Invocation-sourced values are launch parameters, not saved settings.
+  CHECK(toml.find("test_string_flag") == std::string::npos);
+  CHECK(toml.find("test_int32_flag") == std::string::npos);
+
+  // Everything else persists as before.
+  CHECK(toml.find("test_double_flag") != std::string::npos);
+  CHECK(toml.find("test_bool_flag") != std::string::npos);
+
+  SetTestEnv("REX_TEST_INT32_FLAG", "");
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
+
 TEST_CASE("cvar metadata integration test", "[cvar][integration]") {
   rex::cvar::testing::ResetAllForTesting();
 
@@ -672,7 +767,7 @@ TEST_CASE("cvar SerializeToTOML with category filter", "[cvar]") {
 TEST_CASE("cvar SaveConfig", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
-  auto temp_dir = std::filesystem::temp_directory_path();
+  auto temp_dir = TestTempDir();
   auto save_path = temp_dir / "test_save_config.toml";
 
   // Clean up any existing file

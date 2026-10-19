@@ -535,13 +535,55 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
+// Escape the TOML basic string body written between the outer double
+// quotes. Backslashes appear verbatim in Windows paths and would otherwise
+// produce invalid TOML that LoadConfig rejects wholesale.
+std::string EscapeTomlString(std::string_view value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (char ch : value) {
+    unsigned char c = static_cast<unsigned char>(ch);
+    switch (c) {
+      case '"':  escaped += "\\\""; break;
+      case '\\': escaped += "\\\\"; break;
+      case '\b': escaped += "\\b"; break;
+      case '\t': escaped += "\\t"; break;
+      case '\n': escaped += "\\n"; break;
+      case '\f': escaped += "\\f"; break;
+      case '\r': escaped += "\\r"; break;
+      default:
+        // TOML requires all other control characters (and DEL) to be
+        // escaped as \uXXXX.
+        if (c < 0x20 || c == 0x7F) {
+          static constexpr char kHexDigits[] = "0123456789ABCDEF";
+          escaped += "\\u00";
+          escaped += kHexDigits[(c >> 4) & 0x0F];
+          escaped += kHexDigits[c & 0x0F];
+        } else {
+          escaped += ch;
+        }
+        break;
+    }
+  }
+  return escaped;
+}
+
+// Values sourced from this launch's invocation (command-line flags or
+// REX_* environment overrides) are configuration inputs, not saved
+// settings: persisting them would embed launch parameters (e.g. absolute
+// root paths) into the config file and re-assert them on later launches.
+// Only config-file, UI, and runtime-set values belong in the file.
+bool IsInvocationSource(Source source) {
+  return source == Source::kCommandLine || source == Source::kEnvironment;
+}
+
 std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.getter() != entry.default_value) {
+    if (entry.getter() != entry.default_value && !IsInvocationSource(entry.source)) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = \"" + EscapeTomlString(entry.getter()) + "\"\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
@@ -554,9 +596,10 @@ std::string SerializeToTOML(std::string_view category) {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.category == category && entry.getter() != entry.default_value) {
+    if (entry.category == category && entry.getter() != entry.default_value &&
+        !IsInvocationSource(entry.source)) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = \"" + EscapeTomlString(entry.getter()) + "\"\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
