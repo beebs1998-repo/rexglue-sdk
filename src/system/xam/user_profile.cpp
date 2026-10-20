@@ -13,6 +13,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
@@ -21,12 +22,21 @@ namespace rex {
 namespace system {
 namespace xam {
 
+// Signed-in profile gamertag handed to the guest (XamUserGetName /
+// XamUserGetGamerTag / XPROFILE name fields). Games embed it into replay and
+// score data.
+REXCVAR_DEFINE_STRING(profile_name, "User", "Kernel",
+                      "Profile gamertag the guest sees (e.g. replay list, score names)");
+
 UserProfile::UserProfile() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  name_ = REXCVAR_GET(profile_name);
+  if (name_.empty()) {
+    name_ = "User";
+  }
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py
