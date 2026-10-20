@@ -1250,7 +1250,8 @@ bool FunctionGraph::isMergeableEntryPoint(uint32_t addr) const {
 }
 
 TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
-                                         bool isCallInstruction) const {
+                                         bool isCallInstruction,
+                                         const FunctionNode* emitNode) const {
   // Find the caller's function
   const FunctionNode* callerFn = getFunctionContaining(callerAddr);
 
@@ -1259,7 +1260,16 @@ TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
     return TargetKind::Import;
   }
 
-  // Case 2: Target is the caller's own entry point
+  // Case 2: Target is the emitting node's own entry point
+  // b/bc to the emitting node's own base = loop back to function start;
+  // bl to own base stays a recursive call (Function).
+  // Only when the node has blocks (and thus emits a loc_base label); a stub
+  // has no body to goto.
+  if (emitNode && target == emitNode->base() && !emitNode->blocks().empty()) {
+    return isCallInstruction ? TargetKind::Function : TargetKind::InternalLabel;
+  }
+
+  // Case 2b: Target is the containing function's entry point
   if (callerFn && target == callerFn->base()) {
     // bl to own base = recursive call (Function)
     // b to own base = loop back to start (InternalLabel)
@@ -1273,13 +1283,18 @@ TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
     return TargetKind::Function;
   }
 
-  // Case 4: Target is inside caller's function -> InternalLabel
+  // Case 4: Target is inside the emitting function -> InternalLabel
   // For bl, this would be a rare PIC code pattern
+  if (emitNode && emitNode->containsAddress(target)) {
+    return TargetKind::InternalLabel;
+  }
+
+  // Case 5: Target is inside the containing function -> InternalLabel
   if (callerFn && callerFn->containsAddress(target)) {
     return TargetKind::InternalLabel;
   }
 
-  // Case 5: Unknown target
+  // Case 6: Unknown target
   return TargetKind::Unknown;
 }
 

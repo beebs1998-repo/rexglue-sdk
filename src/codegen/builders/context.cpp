@@ -281,7 +281,11 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
 
   // Use classifyTarget for consistent branch classification
   // false = branch instruction (not a call), so own-base means loop back
-  auto kind = graph().classifyTarget(target, base, false);
+  // The emitting node takes precedence over the graph's containing-function
+  // lookup: mid-function entry overrides can carve fragment nodes out of a
+  // larger function, and the fragment then misclassifies branches this
+  // function itself owns.
+  auto kind = graph().classifyTarget(target, base, false, &fn);
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -312,6 +316,17 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
           println("\t\treturn;");
           println("\t}}");
         }
+      } else if (fn.containsAddress(target)) {
+        // The graph classifies this as a call/tail-call but no CallTarget was
+        // pre-resolved for this site (overlapping fragment nodes are the known
+        // cause). The emitting function still owns the target range and emits
+        // a local label for it, so a local branch is sound - prefer it over
+        // baking in a fatal trap.
+        REXCODEGEN_WARN("Conditional branch to 0x{:08X} from 0x{:08X} with no pre-resolved "
+                        "CallTarget; emitting local goto",
+                        target, base);
+        println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond,
+                target);
       } else {
         REXCODEGEN_ERROR("Unresolved conditional branch to 0x{:08X} from 0x{:08X} (no CallTarget)",
                          target, base);

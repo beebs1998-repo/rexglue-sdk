@@ -187,8 +187,14 @@ class FunctionGraph {
   // target: address being branched to
   // callerAddr: address of the branch instruction
   // isCallInstruction: true for bl (expects return), false for b (no return)
+  // emitNode: the FunctionNode currently being recompiled, or nullptr. Mid-
+  // function entry overrides can carve fragment nodes out of a larger
+  // function; the graph's containing-function lookup then resolves to the
+  // fragment instead of the emitting node, misclassifying branches the
+  // emitting node itself owns. The emitting node takes precedence.
   // Returns how the target should be treated during code generation.
-  TargetKind classifyTarget(uint32_t target, uint32_t callerAddr, bool isCallInstruction) const;
+  TargetKind classifyTarget(uint32_t target, uint32_t callerAddr, bool isCallInstruction,
+                            const FunctionNode* emitNode = nullptr) const;
 
  private:
   std::vector<CodeBuffer> codeBuffers_;
