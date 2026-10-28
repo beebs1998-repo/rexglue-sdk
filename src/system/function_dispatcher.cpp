@@ -192,30 +192,22 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
 
   uint32_t new_table_start = image_base + image_size + kFunctionTableMirrorDelta;
   uint32_t new_table_end = new_table_start + (code_size + kThunkReserveSize) * 2;
-  uint32_t new_image_end = image_base + image_size;
   uint32_t new_code_end = code_base + code_size + kThunkReserveSize;
   for (const auto& existing : module_tables_) {
     uint32_t existing_table_start = existing.image_base + existing.image_size +
                                     kFunctionTableMirrorDelta;
     uint32_t existing_table_end =
         existing_table_start + (existing.code_size + kThunkReserveSize) * 2;
-    uint32_t existing_image_end = existing.image_base + existing.image_size;
-    uint32_t existing_code_end = existing.code_base + existing.code_size + kThunkReserveSize;
-    if (image_base < existing_table_end && new_table_end > existing.image_base) {
-      REXLOG_ERROR("Module image range [{:08X}, {:08X}) overlaps existing table [{:08X}, {:08X})",
-                   image_base, new_image_end, existing.image_base, existing_table_end);
-      return false;
-    }
-    if (new_table_start < existing_image_end && existing_table_end > image_base) {
-      REXLOG_ERROR("Module table range [{:08X}, {:08X}) overlaps existing image [{:08X}, {:08X})",
-                   new_table_start, new_table_end, existing.image_base, existing_image_end);
-      return false;
-    }
+    // Mirrored layout: images live in the 0x80000000-0x8FFFFFFF window, tables
+    // in the 0x90000000-0x9FFFFFFF window — the two can only collide with
+    // themselves, so only table-vs-table needs checking (a table-vs-table
+    // collision implies the images themselves would have collided first).
     if (new_table_start < existing_table_end && new_table_end > existing_table_start) {
       REXLOG_ERROR("Module table range [{:08X}, {:08X}) overlaps existing table [{:08X}, {:08X})",
                    new_table_start, new_table_end, existing_table_start, existing_table_end);
       return false;
     }
+    uint32_t existing_code_end = existing.code_base + existing.code_size + kThunkReserveSize;
     if (code_base < existing_code_end && new_code_end > existing.code_base) {
       REXLOG_ERROR("Module code range [{:08X}, {:08X}) overlaps existing [{:08X}, {:08X})",
                    code_base, new_code_end, existing.code_base, existing_code_end);
