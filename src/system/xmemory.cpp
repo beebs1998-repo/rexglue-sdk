@@ -787,7 +787,15 @@ bool Memory::Restore(stream::ByteStream* stream) {
 bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
                                      uint32_t image_size) {
   constexpr uint32_t kThunkReserveSize = runtime::FunctionDispatcher::kThunkReserveSize;
-  uint32_t table_base = image_base + image_size;
+  // Table placement mirrors the module's image into the 0x90000000-0x9FFFFFFF
+  // window (v90000000 heap): several modules are loaded co-resident at their
+  // header-pinned bases (MMPPS shell + MPD modules), so the old "immediately
+  // after the image" placement ran into the next module's image.
+  // kFunctionTableMirrorDelta keeps table vs image / table vs table distances
+  // identical to the distances between the images themselves.
+  constexpr uint32_t kFunctionTableMirrorDelta =
+      runtime::FunctionDispatcher::kFunctionTableMirrorDelta;
+  uint32_t table_base = image_base + image_size + kFunctionTableMirrorDelta;
   uint32_t table_size = (code_size + kThunkReserveSize) * 2;
 
   REXSYS_DEBUG(
@@ -795,7 +803,11 @@ bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uin
       "(+{:08X} thunk reserve)",
       table_base, table_size, code_base, code_base + code_size, kThunkReserveSize);
 
-  if (!heaps_.v80000000.AllocFixed(
+  // Indexed accesses go through the generated macro's linear guest math
+  // (virtual_membase_ + guest VA - virtual heaps carry a zero host offset), so
+  // the region must be committed inside the virtual arena. The mirror delta
+  // always lands the table inside the v90000000 heap.
+  if (!heaps_.v90000000.AllocFixed(
           table_base, table_size, 0x10000,
           memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
           memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
@@ -839,7 +851,7 @@ bool Memory::DestroyFunctionTable(uint32_t code_base) {
   REXSYS_DEBUG("Destroying function table at {:08X}, size {:08X} for code {:08X}-{:08X}",
                table_base, table_size, logged_code_base, logged_code_base + logged_code_size);
 
-  heaps_.v80000000.Release(table_base);
+  heaps_.v90000000.Release(table_base);
   return true;
 }
 

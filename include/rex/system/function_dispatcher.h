@@ -77,7 +77,21 @@ class FunctionDispatcher : public IModuleRegistrar {
   // Shared thunk region size per module.
   static constexpr uint32_t kThunkReserveSize = 0x10000;  // 64KB
 
-  // rexglue function table management (per-module table at IMAGE_BASE + IMAGE_SIZE)
+  // Per-module dispatch-table placement delta. The table must be reachable by
+  // the generated macro's linear guest pointer math (base + guest VA), so it
+  // lives in guest address space — but NOT right after the image (the old
+  // layout), because titles that load several modules co-resident at their
+  // header-pinned bases (MMPPS: shell + five MPD modules) have the following
+  // module's image landing inside the previous module's table.
+  // The mirror delta shifts each table into the 0x90000000-0x9FFFFFFF window
+  // (the v90000000 guest heap, otherwise unused by guest code): table base =
+  // IMAGE_BASE + IMAGE_SIZE + delta. Images never overlap (XEX headers pin
+  // distinct bases), so mirrored tables never collide either. Public for the
+  // Memory side (xmemory.cpp) so both sides derive the region the same way.
+  static constexpr uint32_t kFunctionTableMirrorDelta = 0x10000000;
+
+  // rexglue function table management (per-module table at IMAGE_BASE +
+  // IMAGE_SIZE + kFunctionTableMirrorDelta)
   // Set is_entrypoint=true exactly once for the host-loaded entrypoint so
   // AllocateThunk(caller_address=0) can route to its pool.
   bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,

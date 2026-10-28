@@ -1,11 +1,13 @@
 //=============================================================================
 // Indirect Call Dispatch
 //
-// REX_LOOKUP_FUNC indexes into the per-module dispatch table at
-// IMAGE_BASE + IMAGE_SIZE. REX_CALL_INDIRECT_FUNC bounds-checks the target
-// against the caller's [REX_CODE_BASE, REX_CODE_BASE + REX_CODE_SIZE +
-// REX_THUNK_RESERVE_SIZE) range; out-of-bounds targets and in-bounds
-// unregistered slots fall back to rex::runtime::ResolveIndirectFunction,
+// REX_LOOKUP_FUNC indexes into the per-module dispatch table, which the runtime
+// mirrors at IMAGE_BASE + IMAGE_SIZE + REX_TABLE_DELTA (0x90000000-0x9FFFFFFF
+// window; see FunctionDispatcher::kFunctionTableMirrorDelta for why the table
+// does not sit immediately after the image). REX_CALL_INDIRECT_FUNC bounds-
+// checks the target against the caller's [REX_CODE_BASE, REX_CODE_BASE +
+// REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE) range; out-of-bounds targets and
+// in-bounds unregistered slots fall back to rex::runtime::ResolveIndirectFunction,
 // which queries the global FunctionDispatcher across every loaded module.
 //=============================================================================
 
@@ -16,8 +18,11 @@
 #define REX_PROFILE_INDIRECT_DISPATCH()
 #endif
 
-#define REX_LOOKUP_FUNC(x, y) \
-  (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))
+#define REX_TABLE_DELTA 0x10000000ull
+
+#define REX_LOOKUP_FUNC(x, y)                                                              \
+  (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + REX_TABLE_DELTA +                    \
+                (u64(u32(y) - REX_CODE_BASE) * 2)))
 
 #define REX_CALL_INDIRECT_FUNC(x)                                                          \
   do {                                                                                     \
