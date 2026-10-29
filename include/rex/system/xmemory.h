@@ -547,11 +547,14 @@ class Memory {
   //==========================================================================
   // Recompiled Code Function Table API
   //==========================================================================
-  // Per-module function dispatch table at IMAGE_BASE + IMAGE_SIZE, indexed by
-  // (guest_addr - code_base) * 2. Internally locked: callers may invoke from
-  // any thread.
+  // Per-module dispatch table in host memory, indexed by
+  // (guest_addr - code_base) / 4. The table never lives in guest address space
+  // (guest placement collides with co-resident module images — see
+  // FunctionDispatcher::InitializeFunctionTable). On success *out_table
+  // receives the zero-initialised table. Internally locked: callers may invoke
+  // from any thread.
   bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
-                               uint32_t image_size);
+                               uint32_t image_size, PPCFunc*** out_table = nullptr);
   bool DestroyFunctionTable(uint32_t code_base);
   // Returns false if guest_address is outside every registered module range.
   bool SetFunction(uint32_t guest_address, PPCFunc* host_function);
@@ -579,7 +582,7 @@ class Memory {
   uint8_t* physical_membase_ = nullptr;
 
   struct FunctionTableEntry {
-    uint32_t table_base;
+    PPCFunc** host_table;
     uint32_t code_base;
     uint32_t code_size;
     uint32_t thunk_reserve;

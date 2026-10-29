@@ -777,6 +777,7 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
       } else {
         auto* xex = module->xex_module();
         const auto* image_info = get_image_info();
+        ::PPCFunc** host_table = nullptr;
         if (!image_info) {
           REXSYS_ERROR("ReXModule_GetImageInfo returned null for '{}'", recomp->shared_lib_name);
         } else if (image_info->image_base != xex->base_address() ||
@@ -789,9 +790,13 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
               xex->base_address() + xex->image_size());
         } else if (!function_dispatcher_->InitializeFunctionTable(
                        image_info->code_base, image_info->code_size, image_info->image_base,
-                       image_info->image_size)) {
+                       image_info->image_size, /*is_entrypoint=*/false, &host_table)) {
           REXSYS_ERROR("InitializeFunctionTable failed for module '{}'", recomp->pe_name);
         } else {
+          // Hand the host-side dispatch table to the module's generated code.
+          if (image_info->function_table) {
+            *image_info->function_table = host_table;
+          }
           function_dispatcher_->RegisterModule(lib_key, image_info->code_base, register_func);
           auto global_lock = global_critical_region_.Acquire();
           auto lib_it = module_libraries_.find(lib_key);

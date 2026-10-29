@@ -12,6 +12,7 @@
 #pragma once
 
 #include <rex/types.h>
+#include <rex/ppc/func.h>
 
 struct PPCFuncMapping;
 
@@ -46,6 +47,11 @@ struct PPCImageInfo {
   const PPCFuncMapping* func_mappings;
   bool rexcrt_heap = false;  ///< Set by codegen when [rexcrt] has heap functions
   RegisterModulesFunc register_modules = nullptr;  ///< Set by codegen for multi-binary projects
+  /// Address of the generated module's dispatch-table pointer. The runtime
+  /// allocates the table in host memory (never guest memory, so it cannot
+  /// collide with any guest image/allocation) and stores the pointer here
+  /// before any recompiled code runs.
+  ::PPCFunc*** function_table = nullptr;
   PPCCodegenFlags codegen_flags{};                 ///< Set by codegen from the config flags
 };
 

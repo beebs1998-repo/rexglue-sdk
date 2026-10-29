@@ -785,51 +785,40 @@ bool Memory::Restore(stream::ByteStream* stream) {
 //=============================================================================
 
 bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
-                                     uint32_t image_size) {
+                                     uint32_t image_size, PPCFunc*** out_table) {
   constexpr uint32_t kThunkReserveSize = runtime::FunctionDispatcher::kThunkReserveSize;
-  // Table placement mirrors the module's image into the 0x90000000-0x9FFFFFFF
-  // window (v90000000 heap): several modules are loaded co-resident at their
-  // header-pinned bases (MMPPS shell + MPD modules), so the old "immediately
-  // after the image" placement ran into the next module's image.
-  // kFunctionTableMirrorDelta keeps table vs image / table vs table distances
-  // identical to the distances between the images themselves.
-  constexpr uint32_t kFunctionTableMirrorDelta =
-      runtime::FunctionDispatcher::kFunctionTableMirrorDelta;
-  uint32_t table_base = image_base + image_size + kFunctionTableMirrorDelta;
-  uint32_t table_size = (code_size + kThunkReserveSize) * 2;
+  // The table maps guest code addresses to host function pointers and is only
+  // ever touched by recompiled code through a module-local pointer (see the
+  // generated REX_LOOKUP_FUNC macro), so it lives in host memory. Guest-memory
+  // placement is not viable: co-resident modules at header-pinned bases put the
+  // next module's image inside the previous module's table, and the
+  // 0x90000000-0x9FFFFFFF window is the 4 KB alias of the XEX window (same
+  // storage), so it is not an escape hatch either.
+  size_t slot_count = (size_t(code_size) + kThunkReserveSize) / 4;
+  auto* table = new PPCFunc*[slot_count]();
 
-  REXSYS_DEBUG(
-      "Initializing function table at {:08X}, size {:08X} for code {:08X}-{:08X} "
-      "(+{:08X} thunk reserve)",
-      table_base, table_size, code_base, code_base + code_size, kThunkReserveSize);
+  REXSYS_DEBUG("Initializing host function table at {}, {} slots for code {:08X}-{:08X} "
+               "(+{:08X} thunk reserve)",
+               static_cast<void*>(table), slot_count, code_base, code_base + code_size,
+               kThunkReserveSize);
 
-  // Indexed accesses go through the generated macro's linear guest math
-  // (virtual_membase_ + guest VA - virtual heaps carry a zero host offset), so
-  // the region must be committed inside the virtual arena. The mirror delta
-  // always lands the table inside the v90000000 heap.
-  if (!heaps_.v90000000.AllocFixed(
-          table_base, table_size, 0x10000,
-          memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
-          memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
-    REXSYS_ERROR("Failed to allocate function table at {:08X}", table_base);
-    return false;
+  {
+    std::lock_guard lock(function_tables_mutex_);
+    function_tables_.push_back({
+        .host_table = table,
+        .code_base = code_base,
+        .code_size = code_size,
+        .thunk_reserve = kThunkReserveSize,
+    });
   }
-
-  Zero(table_base, table_size);
-
-  std::lock_guard lock(function_tables_mutex_);
-  function_tables_.push_back({
-      .table_base = table_base,
-      .code_base = code_base,
-      .code_size = code_size,
-      .thunk_reserve = kThunkReserveSize,
-  });
-
+  if (out_table) {
+    *out_table = table;
+  }
   return true;
 }
 
 bool Memory::DestroyFunctionTable(uint32_t code_base) {
-  uint32_t table_base = 0;
+  PPCFunc** host_table = nullptr;
   uint32_t table_size = 0;
   uint32_t logged_code_base = 0;
   uint32_t logged_code_size = 0;
@@ -841,38 +830,40 @@ bool Memory::DestroyFunctionTable(uint32_t code_base) {
     if (it == function_tables_.end()) {
       return false;
     }
-    table_base = it->table_base;
+    host_table = it->host_table;
     table_size = (it->code_size + it->thunk_reserve) * 2;
     logged_code_base = it->code_base;
     logged_code_size = it->code_size;
     function_tables_.erase(it);
   }
 
-  REXSYS_DEBUG("Destroying function table at {:08X}, size {:08X} for code {:08X}-{:08X}",
-               table_base, table_size, logged_code_base, logged_code_base + logged_code_size);
+  REXSYS_DEBUG("Destroying host function table at {}, size {:08X} for code {:08X}-{:08X}",
+               static_cast<void*>(host_table), table_size, logged_code_base,
+               logged_code_base + logged_code_size);
 
-  heaps_.v90000000.Release(table_base);
+  delete[] host_table;
   return true;
 }
 
 bool Memory::SetFunction(uint32_t guest_address, PPCFunc* host_function) {
-  uint32_t table_address = 0;
+  PPCFunc** table = nullptr;
+  uint32_t code_base = 0;
   {
     std::lock_guard lock(function_tables_mutex_);
     for (const auto& entry : function_tables_) {
       uint32_t range_end = entry.code_base + entry.code_size + entry.thunk_reserve;
       if (guest_address >= entry.code_base && guest_address < range_end) {
-        uint64_t offset = (uint64_t(guest_address) - entry.code_base) * 2;
-        table_address = entry.table_base + uint32_t(offset);
+        table = entry.host_table;
+        code_base = entry.code_base;
         break;
       }
     }
   }
-  if (!table_address) {
+  if (!table) {
     return false;
   }
-  auto* slot = TranslateVirtual<PPCFunc**>(table_address);
-  *slot = host_function;
+  // One 8-byte slot per 4 bytes of guest code.
+  table[(guest_address - code_base) / 4] = host_function;
   return true;
 }
 

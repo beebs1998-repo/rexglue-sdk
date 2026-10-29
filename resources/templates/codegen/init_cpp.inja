@@ -17,6 +17,7 @@ const rex::PPCImageInfo PPCImageConfig = {
 {% if has_dll_modules and not is_dll %}
     .register_modules = RegisterRecompiledModules,
 {% endif %}
+    .function_table = &rex_function_table,
     .codegen_flags = {
         .skip_lr = {{ config_flags.skip_lr }},
         .ctr_as_local = {{ config_flags.ctr_as_local }},

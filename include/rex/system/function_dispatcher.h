@@ -77,25 +77,25 @@ class FunctionDispatcher : public IModuleRegistrar {
   // Shared thunk region size per module.
   static constexpr uint32_t kThunkReserveSize = 0x10000;  // 64KB
 
-  // Per-module dispatch-table placement delta. The table must be reachable by
-  // the generated macro's linear guest pointer math (base + guest VA), so it
-  // lives in guest address space — but NOT right after the image (the old
-  // layout), because titles that load several modules co-resident at their
-  // header-pinned bases (MMPPS: shell + five MPD modules) have the following
-  // module's image landing inside the previous module's table.
-  // The mirror delta shifts each table into the 0x90000000-0x9FFFFFFF window
-  // (the v90000000 guest heap, otherwise unused by guest code): table base =
-  // IMAGE_BASE + IMAGE_SIZE + delta. Images never overlap (XEX headers pin
-  // distinct bases), so mirrored tables never collide either. Public for the
-  // Memory side (xmemory.cpp) so both sides derive the region the same way.
-  static constexpr uint32_t kFunctionTableMirrorDelta = 0x10000000;
-
-  // rexglue function table management (per-module table at IMAGE_BASE +
-  // IMAGE_SIZE + kFunctionTableMirrorDelta)
+  // rexglue function table management.
+  //
+  // Each module's dispatch table (guest code address -> host function pointer)
+  // lives in HOST memory, not guest memory: the generated lookup macro indexes
+  // it through a module-local pointer handed over via PPCImageInfo.
+  // Guest-memory placement cannot work for titles that keep several modules
+  // co-resident at their header-pinned bases (MMPPS: shell + five MPD modules):
+  // the next module's image lands inside the previous module's table, and the
+  // 0x90000000-0x9FFFFFFF window is not a separate window at all — it is the
+  // 4 KB-page alias of the 0x80000000-0x8FFFFFFF XEX memory (same storage), so
+  // unregistered slots would be overwritten with image bytes and an in-bounds
+  // indirect call would jump through that garbage.
+  //
   // Set is_entrypoint=true exactly once for the host-loaded entrypoint so
-  // AllocateThunk(caller_address=0) can route to its pool.
+  // AllocateThunk(caller_address=0) can route to its pool. When out_table is
+  // non-null it receives the allocated table for the module.
   bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
-                               uint32_t image_size, bool is_entrypoint = false);
+                               uint32_t image_size, bool is_entrypoint = false,
+                               ::PPCFunc*** out_table = nullptr);
   bool SetFunction(uint32_t guest_address, ::PPCFunc* func) override;
   ::PPCFunc* GetFunction(uint32_t guest_address);
   bool HasAnyFunctionTable() const { return !module_tables_.empty(); }
@@ -136,6 +136,7 @@ class FunctionDispatcher : public IModuleRegistrar {
     uint32_t image_size;
     uint32_t next_thunk_address;
     uint32_t thunk_limit;
+    ::PPCFunc** host_table;  // host-memory dispatch table (module-local)
   };
 
   ModuleTableInfo* FindModuleByAddress(uint32_t guest_address);

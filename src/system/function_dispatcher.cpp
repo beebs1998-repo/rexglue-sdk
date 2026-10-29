@@ -181,7 +181,7 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
 
 bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t code_size,
                                                  uint32_t image_base, uint32_t image_size,
-                                                 bool is_entrypoint) {
+                                                 bool is_entrypoint, ::PPCFunc*** out_table) {
   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
 
   if (is_entrypoint && entrypoint_code_base_ != 0) {
@@ -190,23 +190,12 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
     return false;
   }
 
-  uint32_t new_table_start = image_base + image_size + kFunctionTableMirrorDelta;
-  uint32_t new_table_end = new_table_start + (code_size + kThunkReserveSize) * 2;
+  // Dispatch tables live in host memory now, so only the guest code ranges can
+  // collide between modules. Images may legitimately sit back-to-back (MMPPS'
+  // five modules are pinned at adjacent bases), so image ranges are not checked
+  // here either; the kernel's own loader owns that policy.
   uint32_t new_code_end = code_base + code_size + kThunkReserveSize;
   for (const auto& existing : module_tables_) {
-    uint32_t existing_table_start = existing.image_base + existing.image_size +
-                                    kFunctionTableMirrorDelta;
-    uint32_t existing_table_end =
-        existing_table_start + (existing.code_size + kThunkReserveSize) * 2;
-    // Mirrored layout: images live in the 0x80000000-0x8FFFFFFF window, tables
-    // in the 0x90000000-0x9FFFFFFF window — the two can only collide with
-    // themselves, so only table-vs-table needs checking (a table-vs-table
-    // collision implies the images themselves would have collided first).
-    if (new_table_start < existing_table_end && new_table_end > existing_table_start) {
-      REXLOG_ERROR("Module table range [{:08X}, {:08X}) overlaps existing table [{:08X}, {:08X})",
-                   new_table_start, new_table_end, existing_table_start, existing_table_end);
-      return false;
-    }
     uint32_t existing_code_end = existing.code_base + existing.code_size + kThunkReserveSize;
     if (code_base < existing_code_end && new_code_end > existing.code_base) {
       REXLOG_ERROR("Module code range [{:08X}, {:08X}) overlaps existing [{:08X}, {:08X})",
@@ -215,8 +204,10 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
     }
   }
 
-  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size)) {
-    REXLOG_ERROR("Failed to initialize guest memory function table");
+  ::PPCFunc** host_table = nullptr;
+  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size,
+                                        &host_table)) {
+    REXLOG_ERROR("Failed to initialize host-memory function table");
     return false;
   }
 
@@ -227,10 +218,14 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
       .image_size = image_size,
       .next_thunk_address = code_base + code_size,
       .thunk_limit = code_base + code_size + kThunkReserveSize,
+      .host_table = host_table,
   });
 
   if (is_entrypoint) {
     entrypoint_code_base_ = code_base;
+  }
+  if (out_table) {
+    *out_table = host_table;
   }
 
   REXLOG_INFO("Function table initialized for module: code={:08X}-{:08X}, image={:08X}-{:08X}",
